@@ -4,17 +4,20 @@ Kubernetes backend for [jupyter-scheduler](https://github.com/jupyter-server/jup
 
 ## How It Works
 
-1. Schedule notebook jobs through JupyterLab UI
-2. Files uploaded to S3 bucket for storage
-3. Kubernetes job downloads files, executes notebook in isolated pod
-4. Results uploaded back to S3, then downloaded to JupyterLab and accessible through the UI
+1. Schedule notebook jobs through JupyterLab UI 
+2. **K8s Database**: Job metadata stored in Kubernetes Jobs (replaces SQL database)
+3. **S3 Storage**: Files uploaded to S3 bucket for durability  
+4. **K8s Execution**: Job downloads files, executes notebook in isolated pod
+5. **Results**: Uploaded back to S3, then available in JupyterLab UI
 
 **Key features:**
-- **S3 storage** - files survive Kubernetes cluster or Jupyter Server failures. Supports any S3-compatible storage like AWS S3, MinIO, GCS with S3 API, and so on
-- Parameter injection for notebook customization
-- Multiple output formats (HTML, PDF, etc.)
-- Works with any Kubernetes cluster (Kind, minikube, EKS, GKE, AKS)
-- Configurable resource limits (CPU/memory)
+- **Complete K8s backend** - Database and execution in single K8s cluster
+- **SQL database replacement** - K8s Jobs store all metadata via labels/annotations
+- **S3 file storage** - Files survive cluster failures. Supports AWS S3, MinIO, GCS S3 API
+- **Parameter injection** - Customize notebook execution
+- **Multiple output formats** - HTML, PDF, etc.
+- **Universal K8s support** - Kind, minikube, EKS, GKE, AKS
+- **Resource configuration** - CPU/memory limits per job
 
 ## Requirements
 
@@ -57,7 +60,11 @@ export AWS_SECRET_ACCESS_KEY="<your-secret-key>"
 # export AWS_SESSION_TOKEN="<your-session-token>"
 
 # Launch Jupyter Lab with K8s backend (from same terminal with env vars)
+# Currently: SQL database + K8s execution
 jupyter lab --Scheduler.execution_manager_class="jupyter_scheduler_k8s.K8sExecutionManager"
+
+# Future: K8s database + K8s execution (requires jupyter-scheduler changes)
+# jupyter lab --SchedulerApp.db_url="k8s://default" --Scheduler.execution_manager_class="jupyter_scheduler_k8s.K8sExecutionManager"
 ```
 
 ### Cloud Deployment
@@ -82,11 +89,30 @@ export AWS_SECRET_ACCESS_KEY="<your-secret-key>"
 export K8S_IMAGE="your-registry/jupyter-scheduler-k8s:latest"
 export K8S_NAMESPACE="<your-namespace>"
 
-# Launch Jupyter Lab with K8s backend
-jupyter lab --Scheduler.execution_manager_class="jupyter_scheduler_k8s.K8sExecutionManager"
+# Launch Jupyter Lab with K8s backend  
+# With K8s database (recommended for cloud)
+jupyter lab --SchedulerApp.db_url="k8s://<your-namespace>" --SchedulerApp.execution_manager_class="jupyter_scheduler_k8s.K8sExecutionManager"
 ```
 
 ## Configuration
+
+### K8s Database Backend
+
+The extension can completely replace SQLite/MySQL with Kubernetes as the database:
+
+```python
+# Use K8s Jobs as database (recommended)
+--SchedulerApp.db_url="k8s://namespace"
+
+# Use SQLite (default jupyter-scheduler behavior)  
+--SchedulerApp.db_url="sqlite:///scheduler.sqlite"
+```
+
+**How it works:**
+- K8s Jobs store all job metadata in labels (for queries) and annotations (full records)
+- Automatic when importing jupyter_scheduler_k8s (monkey patches the ORM)
+- Zero SQL dependencies when using K8s backend
+- Same pattern used by Argo Workflows, Tekton Pipelines
 
 ### Environment Variables
 
@@ -101,6 +127,7 @@ jupyter lab --Scheduler.execution_manager_class="jupyter_scheduler_k8s.K8sExecut
 | `K8S_EXECUTOR_MEMORY_LIMIT` | No | `2Gi` | Container memory limit |
 | `K8S_EXECUTOR_CPU_REQUEST` | No | `500m` | Container CPU request |
 | `K8S_EXECUTOR_CPU_LIMIT` | No | `2000m` | Container CPU limit |
+| `K8S_DATABASE_RETENTION_DAYS` | No | Infinite | Days to retain job history (empty for infinite, number for days) |
 
 **S3 Storage Configuration** (required):
 
@@ -191,13 +218,18 @@ make load-image
 ```bash
 make status         # Check environment status
 make clean          # Remove cluster and cleanup
+
+# Database cleanup (optional)
+python -m jupyter_scheduler_k8s.cleanup --dry-run    # See what would be cleaned
+python -m jupyter_scheduler_k8s.cleanup              # Clean old jobs per retention policy
 ```
 
 
 ## Implementation Status
 
-### Working Features ✅
-- Custom `K8sExecutionManager` that extends `jupyter-scheduler.ExecutionManager` and runs notebook jobs in Kubernetes pods
+### Working Features ✅  
+- **K8s execution**: `K8sExecutionManager` runs notebook jobs in Kubernetes pods with S3 file storage
+- **Rich K8s metadata**: Execution jobs store queryable metadata in labels/annotations for advanced analytics
 - Parameter injection and multiple output formats
 - File handling for any notebook size with proven S3 operations
 - Configurable CPU/memory limits

@@ -110,6 +110,28 @@ class K8sExecutionManager(ExecutionManager):
 
         return "Always"
 
+    def _get_job_labels(self, job_metadata: Dict) -> Dict[str, str]:
+        """Generate K8s labels from job metadata for database querying."""
+        def sanitize_label_value(value: str) -> str:
+            value = str(value).lower()
+            value = ''.join(c if c.isalnum() or c in '-_.' else '-' for c in value)
+            value = value.strip('-_.')
+            return value[:63] or "none"
+        
+        labels = {
+            "jupyter-scheduler.io/managed-by": "jupyter-scheduler-k8s",
+            "jupyter-scheduler.io/type": "execution",  # Single job type
+            "jupyter-scheduler.io/job-id": sanitize_label_value(job_metadata["job_id"]),
+            "jupyter-scheduler.io/status": sanitize_label_value(job_metadata.get("status", "created")),
+            "jupyter-scheduler.io/created-at": sanitize_label_value(job_metadata.get("create_time", "")),
+        }
+        
+        # Add name label if present for search
+        if job_metadata.get("name"):
+            labels["jupyter-scheduler.io/name"] = sanitize_label_value(job_metadata["name"])
+            
+        return labels
+
     @classmethod
     def supported_features(cls) -> Dict[JobFeature, bool]:
         return {
@@ -189,7 +211,7 @@ class K8sExecutionManager(ExecutionManager):
             # Upload staging files to S3
             self._upload_to_s3(s3_input_prefix)
 
-            # Create job with S3 configuration
+            # Create job with S3 configuration and database metadata
             job = self._create_s3_execution_job(
                 job_name, s3_input_prefix, s3_output_prefix
             )
@@ -398,22 +420,56 @@ class K8sExecutionManager(ExecutionManager):
             backoff_limit=0,
         )
 
+        # Add database labels and annotations to execution job
+        metadata_kwargs = {"name": job_name}
+        
+        # Store job metadata in K8s for database queries
+        job_data = {
+            "job_id": self.job_id,
+            "name": self.model.name,
+            "status": "IN_PROGRESS", 
+            "create_time": self.model.create_time,
+            "runtime_environment_name": self.model.runtime_environment_name,
+            "parameters": self.model.parameters or {},
+            "output_formats": self.model.output_formats or []
+        }
+        
+        metadata_kwargs["labels"] = self._get_job_labels(job_data)
+        metadata_kwargs["annotations"] = {
+            "jupyter-scheduler.io/job-data": json.dumps(job_data)
+        }
+
         k8s_job = client.V1Job(
             api_version="batch/v1",
             kind="Job",
-            metadata=client.V1ObjectMeta(name=job_name),
+            metadata=client.V1ObjectMeta(**metadata_kwargs),
             spec=job_spec,
         )
 
         return k8s_job
 
     def _cleanup_job(self, job_name: str):
-        """Clean up K8s job (S3 mode - no PVC to clean)."""
-        try:
-            self.k8s_batch.delete_namespaced_job(
-                name=job_name, namespace=self.namespace, propagation_policy="Background"
-            )
-            logger.info(f"Cleaned up job {job_name}")
-        except ApiException as e:
-            if e.status != 404:
-                logger.warning(f"Failed to delete job {job_name}: {e}")
+        """Clean up K8s job based on retention policy."""
+        # Database retention policy (default: infinite retention)
+        retention_days = os.environ.get("K8S_DATABASE_RETENTION_DAYS")
+        
+        if retention_days is None or retention_days == "":
+            # Default: infinite retention
+            logger.info(f"K8s job {job_name} retained indefinitely (default policy)")
+            return
+        elif retention_days.lower() in ["never", "infinite", "0"]:
+            # Never clean up - retain database records forever
+            logger.info(f"Preserving job {job_name} (retention policy: never)")
+            return
+        else:
+            try:
+                retention_days = int(retention_days)
+            except ValueError:
+                logger.warning(f"Invalid K8S_DATABASE_RETENTION_DAYS value '{retention_days}', using default 30 days")
+                retention_days = 30
+        
+        # For now, don't clean up immediately after execution
+        # TODO: Implement background cleanup process that respects retention_days
+        logger.info(f"Preserving job {job_name} (retention: {retention_days} days)")
+        
+        # Future: Add job creation timestamp check and cleanup old jobs

@@ -187,7 +187,48 @@ jupyter lab --Scheduler.execution_manager_class="jupyter_scheduler_k8s.K8sExecut
 
 ## Current Implementation Status
 
-### Latest Architecture: S3 Storage (Production Ready ✅)
+### Latest Architecture: Complete K8s Backend
+
+#### K8s Database Storage ✅ (Implemented, needs integration fix)
+**What we built:**
+- Complete K8s database backend using Jobs with labels/annotations for storage
+- SQLAlchemy-compatible interface (K8sSession, K8sQuery classes)
+- Industry-standard pattern: labels for indexed queries, annotations for full metadata
+- Zero SQL dependencies when using `k8s://` URLs
+
+**Integration Challenge:**
+Monkey patching approach fails due to Jupyter extension load order - jupyter-scheduler calls `create_engine("k8s://namespace")` before our patches apply, causing SQLAlchemy "no such dialect" errors.
+
+**Alternative Approaches Considered:**
+- **Custom K8sScheduler**: Built hybrid scheduler inheriting from jupyter-scheduler's Scheduler class. While we could extend this to handle storage by overriding `create_job()`, `update_job()`, `delete_job()` methods, this approach is architecturally suboptimal because:
+  - **Duplicated Logic**: Reimplementing CRUD operations that already exist in base Scheduler
+  - **Maintenance Burden**: Every jupyter-scheduler update risks breaking our method overrides  
+  - **Complex API**: Users need `--SchedulerApp.scheduler_class="jupyter_scheduler_k8s.K8sScheduler"` vs clean `--SchedulerApp.db_url="k8s://namespace"`
+  - **Partial Override Complexity**: Difficult to cleanly separate which operations use K8s vs SQL
+- **Complete Scheduler Replacement**: Would require vendoring entire SchedulerApp which makes maintenance unsustainable and breaks compatibility with jupyter-scheduler updates
+
+**Next Steps (Manager Approved):**
+Add database backend plugin system to jupyter-scheduler core:
+
+**Required jupyter-scheduler Changes:**
+- **`orm.py:create_session()`**: Add URL scheme detection before calling `sqlalchemy.create_engine()`
+- **`orm.py:create_tables()`**: Add URL scheme detection before SQLAlchemy table creation  
+- **Plugin Registration**: Add mechanism for backends to register handlers for URL schemes
+- **Session Interface**: Ensure non-SQL backends can return objects compatible with existing Scheduler code
+
+**Implementation Pattern:**
+```python
+def create_session(db_url):
+    scheme = db_url.split("://")[0]
+    if scheme in registered_backends:
+        return registered_backends[scheme].create_session(db_url)
+    # Fall back to SQLAlchemy for sqlite://, mysql://, postgresql://, etc.
+    return sqlalchemy_create_session(db_url)
+```
+
+**Result**: Enable `jupyter lab --SchedulerApp.db_url="k8s://default"` with zero breaking changes to existing SQL setups
+
+#### S3 File Storage ✅ (Production Ready)
 1. **Upload inputs** - AWS CLI sync to S3 bucket
 2. **Container execution** - Job downloads from S3, executes notebook, uploads outputs  
 3. **Download outputs** - AWS CLI sync from S3 to staging directory
@@ -196,6 +237,7 @@ jupyter lab --Scheduler.execution_manager_class="jupyter_scheduler_k8s.K8sExecut
 **Key Implementation Details:**
 - **AWS credentials passed at runtime**: K8sExecutionManager passes host AWS credentials to containers via environment variables
 - **Auto pod debugging**: When jobs fail, automatically captures pod logs and container status for troubleshooting
+- **Default retention**: Infinite (changed from 30 days) - set K8S_DATABASE_RETENTION_DAYS to limit
 
 
 ## Code Quality Standards
